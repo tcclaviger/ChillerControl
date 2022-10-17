@@ -1,0 +1,225 @@
+/*    
+Based on work by  
+ RedTar4
+ Bobs_DewPoint_LCD_meter_DHT22_rev7
+ 10/18/18 - 3/10/19
+ and
+ Jobit Joseph  Semicon Media Pvt Ltd (https://circuitdigest.com)
+
+ Currently written for Arduino Nano to be adapted to ESP32 in the future
+ Modified for use as an output trigger(alarmLed) to control a relay controller my water chiller to cool my PC with a 6f hysteresis around the calculated dew point (dewpoint -1 to dewpoint +5)
+ NTC Thermistor used to sample the water temperature should be setup using pin4 > 10k R1 > analog read > NTC 10k > GND
+ Rotary encoder is used to control manual enable of chiller, manual disable of chiller, or function of dew point target logic as a 3 state machine
+ 
+ NEED TO ADD: 
+ PIN INPUT TO TRIGGER RELAY CONTROL FUNCTION ONLY WHILE HIGH AND PAUSE RELAY CONTROL WHILE LOW ALLOWS PC ON CONDITION TO CONTROL CHILLER OPERATION USING ANY CIRCUIT FROM PC ACTIVE WHILE RUNNING (FAN_HEADER)
+ BEEP OUTPUT ON FAILURE WHEN WATER IS HIGHER THAN DEW POINT + 5 AND PAUSE NOT ENABLED BUT RELAY NOT HIGH AS PRECAUTION AGAINST OVERHEATING WHEN CHILLER FAILS TO START
+ BEEP OTUPUT ON FAILURE WHEN WATER IS BELOW DEW POINT -2 BUT RELAY NOT LOW AS A PRECAUTION AGAINST RUNAWAY CHILLER
+ */  
+
+//  Library section
+#include <LiquidCrystal.h>                // LCD library
+  LiquidCrystal lcd(7, 8, 9, 10, 11, 12); // (rs,e,d4,d5,d6,d7),initialize the LCD with the numbers of the interface pins
+#include <DHT.h>                          // DHT22 library, delete any "DHT.U" files from library,or it wont run
+ 
+//  Definition section
+#define CLK 2
+#define DT 3
+#define SW 1
+#define alarmLed 5          // define the output pin
+#define DHTPIN 6            // what arduino pin we're connected to, arduino pin D2
+  DHT dht(DHTPIN, DHT22);   // initialize DHT sensor and create sensor objects
+#define DHTTYPE DHT22       // create DHT 22  (AM2302), AM2321 object
+#define ntc_pin A1          // defines the ntc thermistor input pin
+#define vd_power_pin 4     // defines the output pin for the thermistor
+#define nominal_resistance 10000 //10k thermistor nominal resistance
+#define nominal_temperature 25   //10k resistance temerpature point
+#define samplingrate 5      //sample rate for the thermistor
+#define beta 3950           //beta coefficient of the thermistor 
+#define Rref 10000          //resistance of voltage divider resitance value
+   
+//variable declaration section
+int counter = 0;
+int currentStateCLK;
+int lastStateCLK;
+unsigned long lastButtonPress = 0;
+int samples = 0;
+float minW = 0;
+float maxW = 0;
+float H = 0.0;
+float C = 0.0;
+float F = 0.0;
+float W = 0.0; 
+float HiF = 0.0;
+float DewPoint = 0.0;
+float DP = 0.0;
+int interval = 1000;
+unsigned long previousMillis = 0;
+uint8_t i;
+float average;
+float waterTemperature;
+
+void setup()
+  {
+    
+  //  output pin setup section
+    pinMode(alarmLed, OUTPUT);      //  assigns alarmLed (arduino pin 3) as an output
+    pinMode(vd_power_pin,  OUTPUT); // powers the temperature sampling circuit
+  
+  //rotary encoder
+    pinMode(CLK, INPUT);
+    pinMode(DT, INPUT);
+    pinMode(SW, INPUT_PULLUP);
+    lastStateCLK = digitalRead(CLK);
+    attachInterrupt(0, encoderMonitor, CHANGE);
+    attachInterrupt(1, encoderMonitor, CHANGE);
+
+  //  initilize and start systems
+    Serial.begin(115200); //  sets up serial comm's to 9600 baud
+    dht.begin();        //  initialize the DHT22
+    lcd.begin(16, 2);   //  initialize the LCD's number of columns and rows
+ 
+  //  display and serial print initilization
+    Serial.println("DHTxx test!");
+    lcd.setCursor(0, 0); lcd.print("DHTxx test!");
+    delay(1500);
+    lcd.setCursor(0, 0); lcd.print("                ");
+  }
+
+void loop()
+  {
+    samples = 0;                            // resets samples to 0 on each pass to allow for ADC averaging
+  // take voltage readings from the voltage divider and turn off circuit
+    digitalWrite(vd_power_pin,HIGH);
+    for (i=0; i< samplingrate; i++) {
+    samples += analogRead(ntc_pin);
+    delay(10);
+    }
+    digitalWrite(vd_power_pin, LOW);
+  
+  //calculate average thermistor output voltage on analog pin
+    average = 0;                           //resets average values on each pass
+    average = samples / samplingrate;      //calculates samples as average of samplingrate number of sampled values 
+
+  // Calculate NTC resistance
+    average = 1023 / average - 1;                              //adjust the ADC average to scale to 1024 using 0 start
+    average = Rref / average;                                  //divide nominal resistance of 10000 by the new ADC average
+    waterTemperature = average / nominal_resistance;           // (R/Ro)
+    waterTemperature = log(waterTemperature);                  // ln(R/Ro)
+    waterTemperature /= beta;                                  // 1/B * ln(R/Ro)
+    waterTemperature += 1.0 / (nominal_temperature + 273.15);  // + (1/To)
+    waterTemperature = 1.0 / waterTemperature;                 // Invert
+    waterTemperature -= 273.15;                                // convert absolute temp to C
+
+  unsigned long currentMillis = millis();
+  
+  // Reading temperature and humidity takes about 250 milliseconds
+    if ((unsigned long)(currentMillis-previousMillis)>=interval)
+        {   
+        H = dht.readHumidity();                                //  read humitity as %f
+        C = dht.readTemperature();                             //  read temperature as Celsius (default)
+        F = dht.readTemperature(true);                         //  read temperature as Fahrenheit (if true)
+        previousMillis=currentMillis;                          //  saves currentMillis count as previousMillis for next cycle check
+        } 
+
+  // DHT22 data error check section
+    if (isnan(H) || isnan(C) || isnan(F))
+      {
+      Serial.println("Failed to read from DHT sensor!");
+      lcd.setCursor(0, 0); lcd.print("                ");
+      lcd.setCursor(0, 0); lcd.print(" Failed to read ");
+      lcd.setCursor(0, 1); lcd.print("                ");
+      lcd.setCursor(0, 1); lcd.print("DHT sensor Fail!");
+      return;   //  returns to start of loop
+      }
+
+  //  calculations and conversions section
+    DewPoint = (C - (14.55 + 0.114 * C) * (1 - (0.01 * H)) - pow(((2.5 + 0.007 * C) * (1 - (0.01 * H))),3) - (15.9 + 0.117 * C) * pow((1 - (0.01 * H)), 14)); // more advanced humidity calcuation, dead right
+    //DewPoint = (C - ((100 - H) / 5));   //  dewpoint calculation using Celsius value basic fough calculation
+    DP = (DewPoint * 1.8) + 32;         //  converts dewPoint calculation to fahrenheit
+    W = (waterTemperature * 1.8) + 32;  //converts water temp to farenheit
+    minW = DP+1;                        //sets low water target minimum value
+    maxW = DP+5;                        //sets high water target max value
+
+    //rotary encoder control of the chiller relay alarmLed trigger output
+    if (counter == -1)
+    {
+      digitalWrite(alarmLed, HIGH);
+    }
+    else if (counter == 1)
+    {
+      digitalWrite(alarmLed, LOW);
+    }
+    else if (counter == 0)
+    {
+        //  alarm output section can be used to trigger relay for power to device instead of led output. Creates a 5 degree hysteresis
+    if(W < minW)
+      {digitalWrite(alarmLed, LOW);}
+    else if (W > maxW)
+        {digitalWrite(alarmLed, HIGH);}
+    }
+  
+  //  serial monitor and debug section
+    Serial.print("Sample OK: ");                                               //  prints sample ok to serial monitor
+    Serial.print("Temp: ");Serial.print((int)C);Serial.print("*C, ");          //  prints celsius value to serial monitor and returns cursor
+    Serial.print("Temp: ");Serial.print((int)F);Serial.print("*F, ");          //  prints fahrenheit value to serial monitor and returns cursor
+    Serial.print("Hum: ");Serial.print((int)H);Serial.print("%, ");            //  prints humidity value to serial monitor and returns cursor
+    Serial.print("Dew: ");Serial.print((int)DP);Serial.print("*F, ");          //  prints dewpoint value to serial monitor and returns cursor to next line
+    Serial.print("Dew: ");Serial.print((int)DewPoint);Serial.println("*C, ");  //  prints dewpoint value to serial monitor and returns cursor to next line
+    Serial.print("H20: ");Serial.print((int)W);Serial.println("*F, ");         //prints temperature of water
+
+  //  LCD print section
+    lcd.setCursor(0,  0); lcd.print("Tmp");
+    lcd.setCursor(4,  0); lcd.print(F);
+    lcd.setCursor(6,  0); lcd.print((char)223); lcd.print("f"); //  prints the degree's symbol
+    lcd.setCursor(8,  0); lcd.print("Dew");
+    lcd.setCursor(12, 0); lcd.print(DP);
+    lcd.setCursor(14, 0); lcd.print((char)223); lcd.print("f"); 
+    lcd.setCursor(0,  1); lcd.print("Hum ");
+    lcd.setCursor(4,  1); lcd.print(H);
+    lcd.setCursor(6,  1); lcd.print(" % ");
+    lcd.setCursor(8,  1); lcd.print("H20");
+    lcd.setCursor(12, 1); lcd.print(W);
+    lcd.setCursor(14, 1); lcd.print((char)223); lcd.print("f"); 
+ 
+  // The DHT22 sampling rate is .5HZ (.5 Sec), this delay sets program sample rate to match so no errors happen
+    delay(1000);   
+  }
+
+void encoderMonitor()
+  {
+  //rotary encoder processing
+    currentStateCLK = digitalRead(CLK);
+  //checks for CLK state differences and reacts to only 1 state change to avoid erroneous double counts
+    if (currentStateCLK != lastStateCLK && currentStateCLK == 1)
+    {
+      if (digitalRead(DT) != currentStateCLK)
+      {
+        counter --;
+        if(counter <-1)
+        {
+          counter = -1;
+        }
+      }
+      else
+      {
+        counter ++;
+        if (counter > 1)
+        {
+          counter = 1;
+        }
+      }
+    }
+    lastStateCLK = currentStateCLK;
+    // samples and handles the SW button if the rotary encoder is pressed
+    int btnState = digitalRead(SW);
+    if  (btnState == LOW)
+    {
+      if (millis() - lastButtonPress > 50)
+      {
+        //counter = 0;
+      }
+
+    delay(1);
+    }
+  }
